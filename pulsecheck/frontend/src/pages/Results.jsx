@@ -55,7 +55,7 @@ export default function Results({ query, onBack, onSearch }) {
 
   function fetchData(q, p) {
     setLoading(true); setError(null); setData(null); setInput(q)
-    axios.get(`http://localhost:3001/api/search?q=${encodeURIComponent(q)}&persona=${p}`)
+    axios.get(`${import.meta.env.VITE_API_URL}/api/search?q=${encodeURIComponent(q)}&persona=${p}`)
       .then(r => { setData(r.data); setHotTakeIndex(0) })
       .catch(e => setError(e.response?.data?.error || 'Failed to fetch. Is the backend running?'))
       .finally(() => setLoading(false))

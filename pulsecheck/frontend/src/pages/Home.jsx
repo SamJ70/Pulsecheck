@@ -29,7 +29,7 @@ export default function Home({ onSearch }) {
   const [loadingTrend, setLoadingTrend] = useState(true)
 
   useEffect(() => {
-    axios.get('http://localhost:3001/api/trending')
+    axios.get('${import.meta.env.VITE_API_URL}/api/trending')
       .then(r => setTrending(r.data))
       .catch(() => {})
       .finally(() => setLoadingTrend(false))
