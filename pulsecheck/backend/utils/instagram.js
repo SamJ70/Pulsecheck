@@ -1,6 +1,8 @@
 // backend/utils/instagram.js
-// Multi-method Instagram scraper — no API key needed
-// Methods: 1) Imginn  2) Picuki  3) iGram  4) SaveIG  5) Inflact
+// Public-web Instagram collector without official search API.
+// Discovery: DuckDuckGo web search
+// Enrichment: page metadata from discovered Instagram URLs
+// Fallback: explicit Reddit reference items
 
 const axios = require('axios');
 const cheerio = require('cheerio');
@@ -19,220 +21,251 @@ function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
-// ── Method 1: Imginn ──────────────────────────────────────────────────────────
-async function scrapeImginn(query, limit = 20) {
-  const tag = query.replace(/\s+/g, '').toLowerCase();
-  const url = `https://imginn.com/tag/${encodeURIComponent(tag)}/`;
+function safeText(value) {
+  return typeof value === 'string' ? value.trim() : '';
+}
 
+function toIsoSafe(value) {
+  const d = value ? new Date(value) : new Date();
+  return Number.isNaN(d.getTime()) ? new Date().toISOString() : d.toISOString();
+}
+
+function uniqBy(arr, keyFn) {
+  const seen = new Set();
+  const out = [];
+  for (const item of arr) {
+    const key = keyFn(item);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(item);
+  }
+  return out;
+}
+
+function normalizeUrl(url) {
+  try {
+    const u = new URL(url);
+    u.hash = '';
+    return u.toString();
+  } catch {
+    return safeText(url);
+  }
+}
+
+function isInstagramUrl(url) {
+  try {
+    const u = new URL(url);
+    return u.hostname === 'instagram.com' || u.hostname.endsWith('.instagram.com');
+  } catch {
+    return false;
+  }
+}
+
+function extractMeta(html, pageUrl = '') {
+  const $ = cheerio.load(html || '');
+  const meta = name => $(`meta[name="${name}"]`).attr('content') || '';
+  const prop = name => $(`meta[property="${name}"]`).attr('content') || '';
+
+  const title =
+    safeText(prop('og:title')) ||
+    safeText(meta('twitter:title')) ||
+    safeText($('title').text());
+
+  const description =
+    safeText(prop('og:description')) ||
+    safeText(meta('twitter:description')) ||
+    safeText(meta('description'));
+
+  const image =
+    safeText(prop('og:image')) ||
+    safeText(meta('twitter:image')) ||
+    safeText(meta('twitter:image:src'));
+
+  const publishedAt =
+    safeText(prop('article:published_time')) ||
+    safeText(meta('article:published_time')) ||
+    safeText(prop('og:updated_time'));
+
+  const author =
+    safeText(meta('author')) ||
+    safeText(prop('og:site_name')) ||
+    '';
+
+  const canonical =
+    safeText($('link[rel="canonical"]').attr('href')) ||
+    safeText(prop('og:url')) ||
+    pageUrl;
+
+  return { title, description, image, publishedAt, author, canonical };
+}
+
+async function fetchHtml(url, timeout = 12000) {
   const { data } = await axios.get(url, {
     headers: {
       'User-Agent': randomUA(),
       'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
       'Accept-Language': 'en-US,en;q=0.9',
-      'Referer': 'https://imginn.com/',
+      'Cache-Control': 'no-cache',
+      'Pragma': 'no-cache',
     },
-    timeout: 12000,
+    timeout,
+    maxRedirects: 5,
+    validateStatus: status => status >= 200 && status < 500,
   });
+  return typeof data === 'string' ? data : JSON.stringify(data || '');
+}
 
-  const $ = cheerio.load(data);
-  const posts = [];
+async function discoverInstagramUrls(query, limit = 25) {
+  const tag = query.replace(/\s+/g, '').replace(/^#/, '').toLowerCase();
+  const q = [
+    `site:instagram.com/explore/tags/${tag}`,
+    `site:instagram.com/p/ ${query}`,
+    `site:instagram.com/reel/ ${query}`,
+    `site:instagram.com ${query}`,
+  ].join(' OR ');
 
-  $('.item').each((i, el) => {
+  const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(q)}`;
+  const html = await fetchHtml(url, 12000);
+  const $ = cheerio.load(html);
+  const results = [];
+
+  $('.result__body').each((i, el) => {
     if (i >= limit) return false;
-    const caption = $(el).find('.desc').text().trim()
-      || $(el).find('[class*="caption"]').text().trim()
-      || $(el).find('p').first().text().trim();
-    const likes = $(el).find('[class*="like"]').text().replace(/[^0-9]/g, '') || '0';
-    const imgSrc = $(el).find('img').attr('src') || '';
 
-    if (caption.length > 8) {
-      posts.push({
-        source: 'instagram',
-        title: caption.slice(0, 120),
-        text: caption.slice(0, 500),
-        score: parseInt(likes) || Math.floor(Math.random() * 300) + 20,
-        url: `https://www.instagram.com/explore/tags/${tag}/`,
-        created: new Date().toISOString(),
-        platform: 'instagram',
-        likes: parseInt(likes) || 0,
-        comments: 0,
-        image: imgSrc,
-        username: $(el).find('[class*="user"]').text().trim() || `@${tag}_fan`,
-      });
-    }
-  });
+    const linkEl = $(el).find('.result__title a').first();
+    const rawHref = safeText(linkEl.attr('href'));
+    const title = safeText(linkEl.text());
+    const snippet = safeText($(el).find('.result__snippet').text());
 
-  return posts;
-}
-
-// ── Method 2: Picuki ──────────────────────────────────────────────────────────
-async function scrapePicuki(query, limit = 20) {
-  const tag = query.replace(/\s+/g, '').toLowerCase();
-  const url = `https://www.picuki.com/tag/${encodeURIComponent(tag)}`;
-
-  const { data } = await axios.get(url, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)',
-      'Accept': 'text/html',
-      'Accept-Language': 'en-US,en;q=0.9',
-    },
-    timeout: 12000,
-  });
-
-  const $ = cheerio.load(data);
-  const posts = [];
-
-  $('.photo-description, .box-description').each((i, el) => {
-    if (i >= limit) return false;
-    const text = $(el).text().trim();
-    if (text.length > 8) {
-      posts.push({
-        source: 'instagram',
-        title: text.slice(0, 120),
-        text: text.slice(0, 500),
-        score: Math.floor(Math.random() * 500) + 50,
-        url: `https://www.instagram.com/explore/tags/${tag}/`,
-        created: new Date().toISOString(),
-        platform: 'instagram',
-        likes: 0,
-        comments: 0,
-        username: `@${tag}_post`,
-      });
-    }
-  });
-
-  return posts;
-}
-
-// ── Method 3: iGram / Insta stalker alternative ───────────────────────────────
-async function scrapeInstaStalker(query, limit = 20) {
-  const tag = query.replace(/\s+/g, '').toLowerCase();
-  // Use Instagram's own oEmbed-style endpoint which is public
-  const url = `https://www.instagram.com/explore/tags/${encodeURIComponent(tag)}/?__a=1&__d=dis`;
-
-  const { data } = await axios.get(url, {
-    headers: {
-      'User-Agent': randomUA(),
-      'Accept': 'application/json, text/plain, */*',
-      'X-IG-App-ID': '936619743392459',
-      'X-Requested-With': 'XMLHttpRequest',
-    },
-    timeout: 10000,
-  });
-
-  const medias =
-    data?.data?.recent?.sections?.[0]?.layout_content?.medias ||
-    data?.data?.top?.sections?.[0]?.layout_content?.medias ||
-    [];
-
-  return medias.slice(0, limit).map(m => {
-    const caption = m.media?.caption?.text || '';
-    return {
-      source: 'instagram',
-      title: caption.slice(0, 120) || `#${tag} post`,
-      text: caption.slice(0, 500) || `A popular post about #${tag}`,
-      score: (m.media?.like_count || 0) + (m.media?.comment_count || 0) * 3,
-      url: `https://instagram.com/p/${m.media?.code}`,
-      created: m.media?.taken_at
-        ? new Date(m.media.taken_at * 1000).toISOString()
-        : new Date().toISOString(),
-      platform: 'instagram',
-      likes: m.media?.like_count || 0,
-      comments: m.media?.comment_count || 0,
-      username: `@${m.media?.user?.username || tag}`,
-      image: m.media?.image_versions2?.candidates?.[0]?.url || '',
-    };
-  }).filter(p => p.text.length > 5);
-}
-
-// ── Method 4: Bibliogram / public RSS feeds ───────────────────────────────────
-async function scrapeRSSBridge(query, limit = 20) {
-  const tag = query.replace(/\s+/g, '').toLowerCase();
-  // Try public RSS-bridge instances for Instagram tags
-  const bridges = [
-    `https://rssbridge.pussthecat.org/?action=display&bridge=Instagram&tag=${encodeURIComponent(tag)}&format=Json`,
-    `https://wtf.roflcopter.fr/rss/?action=display&bridge=Instagram&tag=${encodeURIComponent(tag)}&format=Json`,
-  ];
-
-  for (const bridgeUrl of bridges) {
+    let resolved = rawHref;
     try {
-      const { data } = await axios.get(bridgeUrl, {
-        headers: { 'User-Agent': randomUA() },
-        timeout: 8000,
-      });
+      const u = new URL(rawHref);
+      const uddg = u.searchParams.get('uddg');
+      if (uddg) resolved = decodeURIComponent(uddg);
+    } catch {}
 
-      const items = data?.items || [];
-      if (items.length > 0) {
-        return items.slice(0, limit).map(item => ({
-          source: 'instagram',
-          title: (item.title || '').slice(0, 120),
-          text: (item.content_text || item.title || '').replace(/<[^>]+>/g, '').slice(0, 500),
-          score: Math.floor(Math.random() * 400) + 50,
-          url: item.url || `https://www.instagram.com/explore/tags/${tag}/`,
-          created: item.date_published || new Date().toISOString(),
-          platform: 'instagram',
-          likes: 0,
-          comments: 0,
-          username: item.author?.name || `@${tag}`,
-        }));
-      }
-    } catch (_) { /* try next */ }
-  }
-  return [];
+    resolved = normalizeUrl(resolved);
+
+    if (!resolved) return;
+    if (!/instagram\.com/i.test(resolved)) return;
+
+    results.push({
+      url: resolved,
+      title,
+      snippet,
+    });
+  });
+
+  return uniqBy(results, x => x.url);
 }
 
-// ── Method 5: Synthetic from Reddit/news references ──────────────────────────
+async function enrichInstagramCandidate(candidate) {
+  const url = normalizeUrl(candidate.url);
+
+  let pageMeta = {};
+  try {
+    const html = await fetchHtml(url, 12000);
+    pageMeta = extractMeta(html, url);
+  } catch {
+    pageMeta = {};
+  }
+
+  const title =
+    safeText(pageMeta.title) ||
+    safeText(candidate.title) ||
+    'Instagram post';
+
+  const text =
+    safeText(pageMeta.description) ||
+    safeText(candidate.snippet) ||
+    title;
+
+  return {
+    source: 'instagram',
+    title: title.slice(0, 120),
+    text: text.slice(0, 500),
+    score: Math.max(
+      1,
+      text.length +
+        (candidate.snippet ? candidate.snippet.length : 0) +
+        (pageMeta.image ? 10 : 0)
+    ),
+    url,
+    created: pageMeta.publishedAt ? toIsoSafe(pageMeta.publishedAt) : new Date().toISOString(),
+    platform: 'instagram',
+    likes: 0,
+    comments: 0,
+    username: candidate.url.includes('/explore/tags/')
+      ? `#${candidate.url.split('/explore/tags/')[1]?.split('/')[0] || 'tag'}`
+      : '@instagram_user',
+    image: pageMeta.image || '',
+    sourceType: pageMeta.title ? 'page_metadata' : 'search_snippet',
+    snippet: candidate.snippet || '',
+    canonical: pageMeta.canonical || url,
+  };
+}
+
+function redditReferenceItem(post, query) {
+  const title = safeText(post?.data?.title);
+  const permalink = safeText(post?.data?.permalink);
+  const externalUrl = safeText(post?.data?.url);
+  const redditUrl = permalink ? `https://www.reddit.com${permalink}` : externalUrl;
+
+  return {
+    source: 'reddit_reference',
+    title: title.slice(0, 120),
+    text: `[Reddit reference for Instagram] ${title}`.slice(0, 500),
+    score: Math.max(1, post?.data?.score || 1),
+    url: redditUrl || `https://www.reddit.com/search/?q=${encodeURIComponent(query)}`,
+    created: toIsoSafe(post?.data?.created_utc ? post.data.created_utc * 1000 : undefined),
+    platform: 'instagram',
+    likes: Math.floor((post?.data?.score || 0) / 10),
+    comments: post?.data?.num_comments || 0,
+    username: '@reddit_reference',
+    reference_platform: 'instagram',
+    synthetic: true,
+    sourceType: 'reference',
+  };
+}
+
 async function syntheticInstaFromReddit(query, limit = 10) {
-  // Fall back: mine Reddit for Instagram references about this topic
   try {
     const url = `https://www.reddit.com/search.json?q=${encodeURIComponent(query + ' instagram')}&sort=relevance&limit=10&t=month`;
     const { data } = await axios.get(url, {
       headers: { 'User-Agent': 'PulseCheck/1.0' },
       timeout: 8000,
+      validateStatus: status => status >= 200 && status < 500,
     });
 
-    return (data?.data?.children || []).slice(0, limit).map(p => ({
-      source: 'instagram',
-      title: p.data.title?.slice(0, 120) || '',
-      text: `[via Reddit] ${p.data.title || ''}`,
-      score: p.data.score || 1,
-      url: p.data.url || '',
-      created: new Date(p.data.created_utc * 1000).toISOString(),
-      platform: 'instagram',
-      likes: Math.floor(p.data.score / 10),
-      comments: p.data.num_comments || 0,
-      username: '@instagram_reference',
-    })).filter(p => p.title.length > 5);
-  } catch (_) {
+    return (data?.data?.children || [])
+      .slice(0, limit)
+      .map(p => redditReferenceItem(p, query))
+      .filter(p => p.title.length > 5);
+  } catch {
     return [];
   }
 }
 
-// ── Main export ───────────────────────────────────────────────────────────────
 async function searchInstagram(query, limit = 20) {
-  const methods = [
-    { name: 'InstaStalker', fn: () => scrapeInstaStalker(query, limit) },
-    { name: 'Imginn', fn: () => scrapeImginn(query, limit) },
-    { name: 'RSSBridge', fn: () => scrapeRSSBridge(query, limit) },
-    { name: 'Picuki', fn: () => scrapePicuki(query, limit) },
-    { name: 'SyntheticReddit', fn: () => syntheticInstaFromReddit(query, limit) },
-  ];
+  const discovered = await discoverInstagramUrls(query, Math.max(limit * 3, 20));
 
-  for (const method of methods) {
+  const enriched = [];
+  for (const candidate of discovered) {
     try {
-      const results = await method.fn();
-      if (results && results.length > 0) {
-        console.log(`✅ Instagram via ${method.name}: ${results.length} posts`);
-        return results;
-      }
-    } catch (e) {
-      console.warn(`⚠️  Instagram ${method.name} failed: ${e.message}`);
-      await sleep(300);
+      const item = await enrichInstagramCandidate(candidate);
+      if (item && item.title) enriched.push(item);
+      if (enriched.length >= limit) break;
+    } catch {
+      // keep going
     }
   }
 
-  console.warn('⚠️  All Instagram methods failed — returning empty');
-  return [];
+  if (enriched.length > 0) {
+    return uniqBy(enriched, x => x.url).slice(0, limit);
+  }
+
+  const reddit = await syntheticInstaFromReddit(query, limit);
+  return uniqBy(reddit, x => x.url).slice(0, limit);
 }
 
 module.exports = { searchInstagram };

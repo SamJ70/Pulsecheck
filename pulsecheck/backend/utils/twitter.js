@@ -1,6 +1,8 @@
 // backend/utils/twitter.js
-// Multi-method Twitter scraper — no API key, no login
-// Methods: 1) Multiple Nitter instances  2) Twstalker  3) Syndication API  4) Search engines
+// Public-web X/Twitter collector without official search API.
+// Discovery: DuckDuckGo web search
+// Enrichment: page metadata + X oEmbed for discovered post URLs
+// Fallback: explicit Reddit reference items
 
 const axios = require('axios');
 const cheerio = require('cheerio');
@@ -20,297 +22,320 @@ function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
-// List of known working Nitter instances (as of 2024/25)
-const NITTER_INSTANCES = [
-  'https://nitter.privacydev.net',
-  'https://nitter.poast.org',
-  'https://nitter.net',
-  'https://nitter.1d4.us',
-  'https://nitter.kavin.rocks',
-  'https://nitter.unixfox.eu',
-  'https://nitter.moomoo.me',
-  'https://nitter.it',
-  'https://nitter.sethforprivacy.com',
-  'https://twitter.076.ne.jp',
-  'https://nitter.woodland.cafe',
-];
+function safeText(value) {
+  return typeof value === 'string' ? value.trim() : '';
+}
 
-// ── Method 1: Nitter instances (rotated) ─────────────────────────────────────
-async function scrapeNitter(query, limit = 20) {
-  // Shuffle instances so we don't hammer one
-  const shuffled = [...NITTER_INSTANCES].sort(() => Math.random() - 0.5);
+function toIsoSafe(value) {
+  const d = value ? new Date(value) : new Date();
+  return Number.isNaN(d.getTime()) ? new Date().toISOString() : d.toISOString();
+}
 
-  for (const instance of shuffled.slice(0, 6)) {
-    try {
-      const url = `${instance}/search?q=${encodeURIComponent(query)}&f=tweets`;
-      const { data } = await axios.get(url, {
-        headers: {
-          'User-Agent': randomUA(),
-          'Accept': 'text/html,application/xhtml+xml',
-          'Accept-Language': 'en-US,en;q=0.9',
-          'Accept-Encoding': 'gzip, deflate, br',
-          'Connection': 'keep-alive',
-          'Cache-Control': 'no-cache',
-        },
-        timeout: 10000,
-      });
-
-      const $ = cheerio.load(data);
-      const tweets = [];
-
-      // Try multiple CSS selectors (Nitter changed its HTML structure)
-      const selectors = [
-        '.timeline-item',
-        '.tweet-card',
-        '[class*="tweet"]',
-        '.item',
-      ];
-
-      let found = false;
-      for (const sel of selectors) {
-        $(sel).each((i, el) => {
-          if (i >= limit) return false;
-          const text =
-            $(el).find('.tweet-content').text().trim() ||
-            $(el).find('.tweet-text').text().trim() ||
-            $(el).find('[class*="content"]').text().trim();
-
-          if (text.length < 10) return;
-          found = true;
-
-          const statsEl = $(el).find('.tweet-stat');
-          const likes = parseInt($(statsEl[2]).text().replace(/[^0-9]/g, '') || '0') || 0;
-          const retweets = parseInt($(statsEl[1]).text().replace(/[^0-9]/g, '') || '0') || 0;
-          const replies = parseInt($(statsEl[0]).text().replace(/[^0-9]/g, '') || '0') || 0;
-          const username = $(el).find('.username').text().trim() || $(el).find('[class*="user"]').text().trim();
-          const dateTitle = $(el).find('.tweet-date a').attr('title') || $(el).find('time').attr('datetime') || '';
-
-          tweets.push({
-            source: 'twitter',
-            title: text.slice(0, 140),
-            text: text.slice(0, 500),
-            score: likes + retweets * 2 + replies,
-            url: instance + ($(el).find('.tweet-link').attr('href') || $(el).find('a[href*="/status/"]').attr('href') || ''),
-            created: dateTitle ? new Date(dateTitle).toISOString() : new Date().toISOString(),
-            platform: 'twitter',
-            likes,
-            retweets,
-            replies,
-            username: username || '@user',
-          });
-        });
-        if (found) break;
-      }
-
-      if (tweets.length > 0) {
-        console.log(`✅ Twitter via Nitter (${instance}): ${tweets.length} tweets`);
-        return tweets;
-      }
-    } catch (e) {
-      console.warn(`⚠️  Nitter ${instance} failed: ${e.message}`);
-      await sleep(200);
-    }
+function uniqBy(arr, keyFn) {
+  const seen = new Set();
+  const out = [];
+  for (const item of arr) {
+    const key = keyFn(item);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(item);
   }
-  return [];
+  return out;
 }
 
-// ── Method 2: Twitter syndication/embed API (no auth needed) ─────────────────
-async function scrapeTwitterSyndication(query, limit = 20) {
-  // Twitter's syndication endpoint is public and requires no auth
-  const encoded = encodeURIComponent(query);
-  const url = `https://syndication.twitter.com/search/json?q=${encoded}&since_id=0&lang=en&count=${limit}`;
-
-  const { data } = await axios.get(url, {
-    headers: {
-      'User-Agent': randomUA(),
-      'Accept': 'application/json',
-      'Origin': 'https://platform.twitter.com',
-      'Referer': 'https://platform.twitter.com/',
-    },
-    timeout: 10000,
-  });
-
-  const tweets = (data?.tweets || []).slice(0, limit).map(t => ({
-    source: 'twitter',
-    title: (t.text || '').slice(0, 140),
-    text: t.text || '',
-    score: (t.favorite_count || 0) + (t.retweet_count || 0) * 2,
-    url: `https://twitter.com/${t.user?.screen_name}/status/${t.id_str}`,
-    created: t.created_at ? new Date(t.created_at).toISOString() : new Date().toISOString(),
-    platform: 'twitter',
-    likes: t.favorite_count || 0,
-    retweets: t.retweet_count || 0,
-    replies: t.reply_count || 0,
-    username: `@${t.user?.screen_name || 'user'}`,
-  }));
-
-  return tweets;
+function normalizeUrl(url) {
+  try {
+    const u = new URL(url);
+    u.hash = '';
+    if (u.hostname === 'twitter.com') u.hostname = 'x.com';
+    return u.toString();
+  } catch {
+    return safeText(url);
+  }
 }
 
-// ── Method 3: Twstalker / Sotwe scraper ──────────────────────────────────────
-async function scrapeSotwe(query, limit = 20) {
-  const q = encodeURIComponent(query);
-  const url = `https://www.sotwe.com/search?q=${q}`;
+function isTwitterPostUrl(url) {
+  try {
+    const u = new URL(url);
+    const path = u.pathname;
+    return (
+      (u.hostname === 'x.com' || u.hostname === 'twitter.com') &&
+      /\/status\/\d+/.test(path)
+    );
+  } catch {
+    return false;
+  }
+}
 
-  const { data } = await axios.get(url, {
-    headers: {
-      'User-Agent': randomUA(),
-      'Accept': 'text/html',
-    },
-    timeout: 10000,
-  });
+function parseUsernameFromUrl(url) {
+  try {
+    const u = new URL(url);
+    const parts = u.pathname.split('/').filter(Boolean);
+    return parts[0] ? `@${parts[0]}` : '@user';
+  } catch {
+    return '@user';
+  }
+}
 
-  const $ = cheerio.load(data);
-  const tweets = [];
-
-  $('[class*="tweet"], [class*="post"], article').each((i, el) => {
-    if (i >= limit) return false;
-    const text = $(el).find('[class*="text"], [class*="content"], p').first().text().trim();
-    if (text.length > 10) {
-      tweets.push({
-        source: 'twitter',
-        title: text.slice(0, 140),
-        text: text.slice(0, 500),
-        score: Math.floor(Math.random() * 200) + 10,
-        url: `https://twitter.com/search?q=${q}`,
-        created: new Date().toISOString(),
-        platform: 'twitter',
-        likes: 0,
-        retweets: 0,
-        replies: 0,
-        username: '@user',
-      });
+function ddgResultUrl(href) {
+  if (!href) return '';
+  try {
+    const u = new URL(href);
+    const uddg = u.searchParams.get('uddg');
+    if (uddg) return decodeURIComponent(uddg);
+    if (u.hostname.includes('duckduckgo.com') && u.searchParams.get('uddg')) {
+      return decodeURIComponent(u.searchParams.get('uddg'));
     }
-  });
-
-  return tweets;
+    return href;
+  } catch {
+    return href;
+  }
 }
 
-// ── Method 4: TweetDeck public search via embed ───────────────────────────────
-async function scrapePublishTwitter(query, limit = 20) {
-  // Twitter's publish endpoint returns embed HTML with tweet content
-  const q = encodeURIComponent(query + ' lang:en');
-  const url = `https://publish.twitter.com/oembed?url=https://twitter.com/search?q=${q}&omit_script=true`;
+function extractMeta(html, pageUrl = '') {
+  const $ = cheerio.load(html || '');
+  const meta = name => $(`meta[name="${name}"]`).attr('content') || '';
+  const prop = name => $(`meta[property="${name}"]`).attr('content') || '';
 
+  const title =
+    safeText(prop('og:title')) ||
+    safeText(meta('twitter:title')) ||
+    safeText($('title').text());
+
+  const description =
+    safeText(prop('og:description')) ||
+    safeText(meta('twitter:description')) ||
+    safeText(meta('description'));
+
+  const image =
+    safeText(prop('og:image')) ||
+    safeText(meta('twitter:image')) ||
+    safeText(meta('twitter:image:src'));
+
+  const publishedAt =
+    safeText(prop('article:published_time')) ||
+    safeText(meta('article:published_time')) ||
+    safeText(prop('og:updated_time'));
+
+  const author =
+    safeText(meta('author')) ||
+    safeText(prop('og:site_name')) ||
+    '';
+
+  const canonical =
+    safeText($('link[rel="canonical"]').attr('href')) ||
+    safeText(prop('og:url')) ||
+    pageUrl;
+
+  return { title, description, image, publishedAt, author, canonical };
+}
+
+async function fetchHtml(url, timeout = 12000) {
   const { data } = await axios.get(url, {
-    headers: { 'User-Agent': randomUA() },
-    timeout: 8000,
+    headers: {
+      'User-Agent': randomUA(),
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Cache-Control': 'no-cache',
+      'Pragma': 'no-cache',
+    },
+    timeout,
+    maxRedirects: 5,
+    validateStatus: status => status >= 200 && status < 500,
+  });
+  return typeof data === 'string' ? data : JSON.stringify(data || '');
+}
+
+async function discoverTwitterUrls(query, limit = 25) {
+  const q = `site:x.com OR site:twitter.com ${query}`;
+  const url = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(q)}`;
+
+  const html = await fetchHtml(url, 12000);
+  const $ = cheerio.load(html);
+  const results = [];
+
+  $('.result__body').each((i, el) => {
+    if (i >= limit) return false;
+
+    const linkEl = $(el).find('.result__title a').first();
+    const rawHref = safeText(linkEl.attr('href'));
+    const resolved = normalizeUrl(ddgResultUrl(rawHref));
+    const title = safeText(linkEl.text());
+    const snippet = safeText($(el).find('.result__snippet').text());
+
+    if (!resolved) return;
+    if (!/x\.com|twitter\.com/i.test(resolved)) return;
+
+    results.push({
+      url: resolved,
+      title,
+      snippet,
+    });
   });
 
-  const html = data?.html || '';
-  const $ = cheerio.load(html);
-  const text = $('blockquote').text().trim();
+  return uniqBy(results, x => x.url);
+}
 
-  if (text.length > 10) {
-    return [{
+async function tryXoEmbed(url) {
+  if (!isTwitterPostUrl(url)) return null;
+
+  try {
+    const embedUrl = `https://publish.x.com/oembed?url=${encodeURIComponent(url)}&omit_script=true`;
+    const { data } = await axios.get(embedUrl, {
+      headers: { 'User-Agent': randomUA(), 'Accept': 'application/json' },
+      timeout: 12000,
+      validateStatus: status => status >= 200 && status < 500,
+    });
+
+    if (!data || typeof data !== 'object') return null;
+
+    const $ = cheerio.load(data.html || '');
+    const text = safeText($('blockquote').text())
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    const authorName = safeText(data.author_name) || parseUsernameFromUrl(url);
+    const authorUrl = safeText(data.author_url) || '';
+    const username = authorUrl ? parseUsernameFromUrl(authorUrl) : parseUsernameFromUrl(url);
+
+    return {
       source: 'twitter',
-      title: text.slice(0, 140),
-      text: text.slice(0, 500),
-      score: 50,
-      url: `https://twitter.com/search?q=${encodeURIComponent(query)}`,
+      title: text.slice(0, 140) || safeText(data.title) || 'X post',
+      text: text.slice(0, 500) || safeText(data.title) || '',
+      score: Math.max(10, text.length),
+      url: normalizeUrl(url),
       created: new Date().toISOString(),
       platform: 'twitter',
       likes: 0,
       retweets: 0,
       replies: 0,
-      username: '@embed',
-    }];
+      username: username || `@${authorName.replace(/^@/, '')}`,
+      author_name: authorName,
+      sourceType: 'x_oembed',
+      raw_embed: data.html || '',
+    };
+  } catch {
+    return null;
   }
-  return [];
 }
 
-// ── Method 5: DuckDuckGo search for tweets ────────────────────────────────────
-async function scrapeTweetsViaDDG(query, limit = 15) {
-  const q = encodeURIComponent(`site:twitter.com OR site:x.com ${query}`);
-  const url = `https://html.duckduckgo.com/html/?q=${q}`;
+async function enrichTwitterCandidate(candidate) {
+  const url = normalizeUrl(candidate.url);
 
-  const { data } = await axios.get(url, {
-    headers: {
-      'User-Agent': randomUA(),
-      'Accept': 'text/html',
-    },
-    timeout: 12000,
-  });
+  let pageMeta = {};
+  try {
+    const html = await fetchHtml(url, 12000);
+    pageMeta = extractMeta(html, url);
+  } catch {
+    pageMeta = {};
+  }
 
-  const $ = cheerio.load(data);
-  const tweets = [];
+  let oembed = null;
+  try {
+    oembed = await tryXoEmbed(url);
+  } catch {
+    oembed = null;
+  }
 
-  $('.result__body').each((i, el) => {
-    if (i >= limit) return false;
-    const snippet = $(el).find('.result__snippet').text().trim();
-    const link = $(el).find('.result__url').text().trim();
-    const title = $(el).find('.result__title').text().trim();
+  const title =
+    safeText(oembed?.title) ||
+    safeText(pageMeta.title) ||
+    safeText(candidate.title) ||
+    'X post';
 
-    if (snippet.length > 15) {
-      tweets.push({
-        source: 'twitter',
-        title: title.slice(0, 140),
-        text: snippet.slice(0, 500),
-        score: Math.floor(Math.random() * 100) + 5,
-        url: link.startsWith('http') ? link : `https://${link}`,
-        created: new Date().toISOString(),
-        platform: 'twitter',
-        likes: 0,
-        retweets: 0,
-        replies: 0,
-        username: '@twitter_user',
-      });
-    }
-  });
+  const text =
+    safeText(oembed?.text) ||
+    safeText(pageMeta.description) ||
+    safeText(candidate.snippet) ||
+    title;
 
-  return tweets;
+  return {
+    source: 'twitter',
+    title: title.slice(0, 140),
+    text: text.slice(0, 500),
+    score: Math.max(
+      1,
+      text.length +
+        (candidate.snippet ? candidate.snippet.length : 0) +
+        (pageMeta.image ? 15 : 0)
+    ),
+    url,
+    created: pageMeta.publishedAt ? toIsoSafe(pageMeta.publishedAt) : new Date().toISOString(),
+    platform: 'twitter',
+    likes: 0,
+    retweets: 0,
+    replies: 0,
+    username: oembed?.username || parseUsernameFromUrl(url),
+    author_name: oembed?.author_name || pageMeta.author || '',
+    image: pageMeta.image || '',
+    sourceType: oembed?.sourceType || (pageMeta.title ? 'page_metadata' : 'search_snippet'),
+    snippet: candidate.snippet || '',
+    canonical: pageMeta.canonical || url,
+  };
 }
 
-// ── Method 6: Synthetic from Reddit mentions ──────────────────────────────────
+function redditReferenceItem(post, query) {
+  const title = safeText(post?.data?.title);
+  const permalink = safeText(post?.data?.permalink);
+  const externalUrl = safeText(post?.data?.url);
+  const redditUrl = permalink ? `https://www.reddit.com${permalink}` : externalUrl;
+
+  return {
+    source: 'reddit_reference',
+    title: title.slice(0, 140),
+    text: `[Reddit reference for Twitter] ${title}`.slice(0, 500),
+    score: Math.max(1, Math.floor((post?.data?.score || 0) / 5)),
+    url: redditUrl || `https://www.reddit.com/search/?q=${encodeURIComponent(query)}`,
+    created: toIsoSafe(post?.data?.created_utc ? post.data.created_utc * 1000 : undefined),
+    platform: 'twitter',
+    likes: Math.floor((post?.data?.score || 0) / 20),
+    retweets: 0,
+    replies: post?.data?.num_comments || 0,
+    username: '@reddit_reference',
+    reference_platform: 'twitter',
+    synthetic: true,
+    sourceType: 'reference',
+  };
+}
+
 async function syntheticTwitterFromReddit(query, limit = 10) {
   try {
     const url = `https://www.reddit.com/search.json?q=${encodeURIComponent(query + ' twitter')}&sort=relevance&limit=10&t=month`;
     const { data } = await axios.get(url, {
       headers: { 'User-Agent': 'PulseCheck/1.0' },
       timeout: 8000,
+      validateStatus: status => status >= 200 && status < 500,
     });
 
-    return (data?.data?.children || []).slice(0, limit).map(p => ({
-      source: 'twitter',
-      title: p.data.title?.slice(0, 140) || '',
-      text: `[Twitter buzz via Reddit] ${p.data.title || ''}`,
-      score: Math.floor(p.data.score / 5) || 1,
-      url: p.data.url || '',
-      created: new Date(p.data.created_utc * 1000).toISOString(),
-      platform: 'twitter',
-      likes: Math.floor(p.data.score / 20),
-      retweets: 0,
-      replies: 0,
-      username: '@twitter_reference',
-    })).filter(p => p.title.length > 5);
-  } catch (_) { return []; }
+    return (data?.data?.children || [])
+      .slice(0, limit)
+      .map(p => redditReferenceItem(p, query))
+      .filter(p => p.title.length > 5);
+  } catch {
+    return [];
+  }
 }
 
-// ── Main export ───────────────────────────────────────────────────────────────
 async function searchTwitter(query, limit = 20) {
-  const methods = [
-    { name: 'Nitter', fn: () => scrapeNitter(query, limit) },
-    { name: 'Syndication', fn: () => scrapeTwitterSyndication(query, limit) },
-    { name: 'Sotwe', fn: () => scrapeSotwe(query, limit) },
-    { name: 'DDG', fn: () => scrapeTweetsViaDDG(query, limit) },
-    { name: 'SyntheticReddit', fn: () => syntheticTwitterFromReddit(query, limit) },
-  ];
+  const discovered = await discoverTwitterUrls(query, Math.max(limit * 3, 20));
 
-  for (const method of methods) {
+  const enriched = [];
+  for (const candidate of discovered) {
     try {
-      const results = await method.fn();
-      if (results && results.length > 0) {
-        console.log(`✅ Twitter via ${method.name}: ${results.length} tweets`);
-        return results;
-      }
-    } catch (e) {
-      console.warn(`⚠️  Twitter ${method.name} failed: ${e.message}`);
-      await sleep(300);
+      const item = await enrichTwitterCandidate(candidate);
+      if (item && item.title) enriched.push(item);
+      if (enriched.length >= limit) break;
+    } catch {
+      // keep going
     }
   }
 
-  console.warn('⚠️  All Twitter methods failed — returning empty');
-  return [];
+  if (enriched.length > 0) {
+    return uniqBy(enriched, x => x.url).slice(0, limit);
+  }
+
+  const reddit = await syntheticTwitterFromReddit(query, limit);
+  return uniqBy(reddit, x => x.url).slice(0, limit);
 }
 
 module.exports = { searchTwitter };
